@@ -16,7 +16,7 @@ app = Flask(__name__)
 # Store active duels
 active_duels: Dict[str, 'DuelGame'] = {}
 
-# Track which users are currently in a match
+# Track which users are currently in an ACTIVE match (game started)
 users_in_match: Dict[int, str] = {}  # user_id -> duel_key
 
 class DuelGame:
@@ -187,7 +187,7 @@ class DuelView(View):
         
         self.game.started = True
         
-        # Mark both users as being in a match
+        # Mark both users as being in a match ONLY after they accept
         users_in_match[self.game.player1.id] = f"{self.game.player1.id}_{self.game.player2.id}"
         users_in_match[self.game.player2.id] = f"{self.game.player1.id}_{self.game.player2.id}"
         
@@ -211,6 +211,12 @@ class DuelView(View):
         for child in self.children:
             child.disabled = True
         await interaction.message.edit(view=self)
+        
+        # Remove the challenge from active_duels since game has started
+        duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
+        reverse_key = f"{self.game.player2.id}_{self.game.player1.id}"
+        active_duels.pop(duel_key, None)
+        active_duels.pop(reverse_key, None)
     
     @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.red)
     async def decline_button(self, interaction: discord.Interaction, button: Button):
@@ -298,25 +304,25 @@ async def duel(interaction: discord.Interaction, opponent: discord.User):
         await interaction.response.send_message("You can't duel yourself!", ephemeral=True)
         return
     
-    # Check if challenger is already in a match
+    # Check if challenger is already in an ACTIVE match
     if interaction.user.id in users_in_match:
         await interaction.response.send_message("❌ You can't duel someone while you're inside a match! Use /cancel to end your current match first.", ephemeral=True)
         return
     
-    # Check if opponent is already in a match
+    # Check if opponent is already in an ACTIVE match
     if opponent.id in users_in_match:
         await interaction.response.send_message(f"❌ You can't duel {opponent.display_name} because they are already in a match!", ephemeral=True)
         return
     
-    # Check if duel already exists
+    # Check if a pending duel already exists between them
     duel_key = f"{interaction.user.id}_{opponent.id}"
     reverse_key = f"{opponent.id}_{interaction.user.id}"
     
     if duel_key in active_duels or reverse_key in active_duels:
-        await interaction.response.send_message("A duel already exists between you two! Use /cancel to cancel it.", ephemeral=True)
+        await interaction.response.send_message("A duel challenge already exists between you two! Please wait for them to accept or decline.", ephemeral=True)
         return
     
-    # Create new game
+    # Create new game (pending, not started yet)
     game = DuelGame(interaction.user, opponent)
     active_duels[duel_key] = game
     
@@ -332,56 +338,49 @@ async def duel(interaction: discord.Interaction, opponent: discord.User):
 
 @bot.tree.command(name="cancel", description="Cancel your current duel")
 async def cancel(interaction: discord.Interaction):
-    # Check if user is in any active duel
-    user_duel = None
-    duel_key = None
+    # First check if user is in an ACTIVE match
+    if interaction.user.id in users_in_match:
+        # Find the active game
+        user_duel = None
+        for key, game in active_duels.items():
+            if (game.player1 == interaction.user or game.player2 == interaction.user) and game.started:
+                user_duel = game
+                break
+        
+        if user_duel:
+            # Cancel active match with opponent confirmation
+            opponent = user_duel.player2 if user_duel.player1 == interaction.user else user_duel.player1
+            view = CancelView(user_duel, interaction.user, opponent)
+            await interaction.response.send_message(
+                f"⚠️ **{interaction.user.display_name}** wants to cancel the match!\n"
+                f"{opponent.mention}, do you agree to cancel?",
+                view=view
+            )
+            return
     
-    # First check if user is in a match
-    if interaction.user.id not in users_in_match:
-        await interaction.response.send_message("❌ You can't cancel without being inside a match!", ephemeral=True)
-        return
-    
-    # Find the duel
+    # Check if user has a pending challenge (waiting for response)
+    pending_duel = None
+    pending_key = None
     for key, game in active_duels.items():
-        if game.player1 == interaction.user or game.player2 == interaction.user:
-            user_duel = game
-            duel_key = key
+        if (game.player1 == interaction.user or game.player2 == interaction.user) and not game.started:
+            pending_duel = game
+            pending_key = key
             break
     
-    if not user_duel:
-        # This shouldn't happen if users_in_match is accurate, but just in case
-        users_in_match.pop(interaction.user.id, None)
-        await interaction.response.send_message("❌ You can't cancel without being inside a match!", ephemeral=True)
-        return
-    
-    # If match hasn't started yet (waiting for acceptance)
-    if not user_duel.started:
-        opponent = user_duel.player2 if user_duel.player1 == interaction.user else user_duel.player1
-        
-        # Cancel immediately without confirmation
-        user_duel.cancelled = True
+    if pending_duel:
+        # Cancel the pending challenge immediately
+        opponent = pending_duel.player2 if pending_duel.player1 == interaction.user else pending_duel.player1
+        pending_duel.cancelled = True
         await interaction.response.send_message(f"❌ **{interaction.user.display_name}** cancelled the duel challenge!")
         
         # Clean up
-        reverse_key = f"{user_duel.player2.id}_{user_duel.player1.id}"
-        active_duels.pop(duel_key, None)
+        reverse_key = f"{pending_duel.player2.id}_{pending_duel.player1.id}"
+        active_duels.pop(pending_key, None)
         active_duels.pop(reverse_key, None)
-        # Remove from users_in_match if they were added (they shouldn't be yet)
-        users_in_match.pop(interaction.user.id, None)
-        users_in_match.pop(opponent.id, None)
         return
     
-    # If match has started, ask for opponent confirmation
-    opponent = user_duel.player2 if user_duel.player1 == interaction.user else user_duel.player1
-    
-    view = CancelView(user_duel, interaction.user, opponent)
-    
-    # Send public message that everyone can see with cancel buttons
-    await interaction.response.send_message(
-        f"⚠️ **{interaction.user.display_name}** wants to cancel the match!\n"
-        f"{opponent.mention}, do you agree to cancel?",
-        view=view
-    )
+    # If not in any match or pending challenge
+    await interaction.response.send_message("❌ You can't cancel without being inside a match or having a pending challenge!", ephemeral=True)
 
 # Flask route for health check
 @app.route('/')
