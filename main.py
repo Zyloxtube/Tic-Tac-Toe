@@ -9,6 +9,9 @@ from flask import Flask, jsonify
 import threading
 import os
 import time
+import chess
+import chess.svg
+import cairosvg
 
 # Flask app for health checks
 app = Flask(__name__)
@@ -19,7 +22,81 @@ active_duels: Dict[str, 'DuelGame'] = {}
 # Track which users are currently in an ACTIVE match (game started)
 users_in_match: Dict[int, str] = {}  # user_id -> duel_key
 
-class DuelGame:
+class ChessGame:
+    def __init__(self, player1: discord.User, player2: discord.User):
+        self.player1 = player1  # White
+        self.player2 = player2  # Black
+        self.board = chess.Board()
+        self.current_turn = "White"  # White always starts
+        self.winner = None
+        self.game_over = False
+        self.current_message = None
+        self.channel = None
+        self.started = False
+        self.cancelled = False
+        self.waiting_for_move = False
+        self.current_player_id = player1.id
+        
+    def make_move(self, move_san: str, user_id: int) -> tuple[bool, str]:
+        """Make a move. Returns (success, message)"""
+        if self.game_over or self.cancelled:
+            return False, "Game is over!"
+        
+        # Check if it's the player's turn
+        expected_player = self.player1.id if self.current_turn == "White" else self.player2.id
+        if user_id != expected_player:
+            return False, "Not your turn!"
+        
+        try:
+            # Try to parse the move
+            move = self.board.parse_san(move_san)
+            if move in self.board.legal_moves:
+                self.board.push(move)
+                
+                # Check game over conditions
+                if self.board.is_checkmate():
+                    self.game_over = True
+                    self.winner = self.player1 if self.current_turn == "White" else self.player2
+                    return True, f"Checkmate! {self.winner.display_name} wins!"
+                elif self.board.is_stalemate():
+                    self.game_over = True
+                    return True, "Stalemate! Game is a draw."
+                elif self.board.is_insufficient_material():
+                    self.game_over = True
+                    return True, "Insufficient material! Game is a draw."
+                
+                # Switch turns
+                self.current_turn = "Black" if self.current_turn == "White" else "White"
+                self.current_player_id = self.player2.id if self.current_turn == "White" else self.player1.id
+                
+                # Check for check
+                if self.board.is_check():
+                    current_player_name = self.player1.display_name if self.current_turn == "White" else self.player2.display_name
+                    return True, f"Move accepted! Check! {current_player_name}'s turn."
+                else:
+                    current_player_name = self.player1.display_name if self.current_turn == "White" else self.player2.display_name
+                    return True, f"Move accepted! {current_player_name}'s turn."
+            else:
+                return False, "Illegal move!"
+        except Exception as e:
+            return False, f"Invalid move format! Use algebraic notation (e.g., 'e4', 'Nf3', 'O-O'). Error: {str(e)}"
+    
+    def get_board_image(self) -> discord.File:
+        """Generate PNG image of current board"""
+        svg_string = chess.svg.board(board=self.board, size=400)
+        png_bytes = cairosvg.svg2png(bytestring=svg_string.encode('utf-8'))
+        return discord.File(io.BytesIO(png_bytes), filename='chess.png')
+    
+    def get_legal_moves_text(self) -> str:
+        """Get list of legal moves as string"""
+        moves = list(self.board.legal_moves)
+        san_moves = [self.board.san(move) for move in moves[:15]]  # Limit to 15
+        moves_text = ", ".join(san_moves)
+        if len(moves) > 15:
+            moves_text += f"... and {len(moves)-15} more"
+        return moves_text
+
+class TicTacToeGame:
     def __init__(self, player1: discord.User, player2: discord.User):
         self.player1 = player1
         self.player2 = player2
@@ -115,8 +192,69 @@ class DuelGame:
         img_buffer.seek(0)
         return img_buffer
 
+class ChessView(View):
+    def __init__(self, game: ChessGame):
+        super().__init__(timeout=300)
+        self.game = game
+        
+    @discord.ui.button(label="♟️ Make Move", style=discord.ButtonStyle.primary, row=0)
+    async def move_button(self, interaction: discord.Interaction, button: Button):
+        if self.game.cancelled or self.game.game_over:
+            await interaction.response.send_message("Game is over!", ephemeral=True)
+            return
+        
+        # Send ephemeral message asking for move
+        await interaction.response.send_message(
+            f"**Make your move!**\n"
+            f"Type your move in algebraic notation:\n"
+            f"• `e4`, `d5` (pawn moves)\n"
+            f"• `Nf3`, `Bc5` (knight/bishop)\n"
+            f"• `O-O`, `O-O-O` (castling)\n"
+            f"• `exd5` (capture)\n"
+            f"• `e8=Q` (promotion)\n\n"
+            f"**Legal moves:** {self.game.get_legal_moves_text()}",
+            ephemeral=True
+        )
+        
+        # Wait for response
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+        
+        try:
+            msg = await self.game.channel.wait_for('message', timeout=60.0, check=check)
+            success, result = self.game.make_move(msg.content, interaction.user.id)
+            
+            if success:
+                # Delete the move message to keep chat clean
+                await msg.delete()
+                
+                # Get new board image
+                board_file = self.game.get_board_image()
+                
+                # Create response
+                if self.game.game_over:
+                    await interaction.edit_original_response(content=f"🏆 **{result}** 🏆", view=None, attachments=[board_file])
+                    # Clean up
+                    duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
+                    reverse_key = f"{self.game.player2.id}_{self.game.player1.id}"
+                    active_duels.pop(duel_key, None)
+                    active_duels.pop(reverse_key, None)
+                    users_in_match.pop(self.game.player1.id, None)
+                    users_in_match.pop(self.game.player2.id, None)
+                else:
+                    current_player = self.game.player1 if self.game.current_turn == "White" else self.game.player2
+                    await interaction.edit_original_response(
+                        content=f"**CHESS GAME**\n{result}\n{current_player.mention}'s turn!",
+                        attachments=[board_file]
+                    )
+            else:
+                await interaction.followup.send(f"❌ {result}", ephemeral=True)
+                
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⏰ Move time expired! Use `/move` command to continue.", ephemeral=True)
+
 class TicTacToeView(View):
-    def __init__(self, game: DuelGame, current_player: discord.User):
+    def __init__(self, game: TicTacToeGame, current_player: discord.User):
         super().__init__(timeout=300)
         self.game = game
         self.current_player = current_player
@@ -198,76 +336,81 @@ class TicTacToeView(View):
                 users_in_match.pop(self.game.player1.id, None)
                 users_in_match.pop(self.game.player2.id, None)
             else:
-                turn_msg = f"🎮 **{self.game.current_turn}**'s turn ({expected_player.display_name})\nClick the buttons below to play!"
+                turn_msg = f"🎮 **Tic Tac Toe**\n{self.game.current_turn}'s turn ({expected_player.display_name})\nClick the buttons below to play!"
                 
                 # Edit the existing message with new board and buttons
                 await interaction.response.edit_message(content=turn_msg, view=new_view, attachments=[file])
         
         return callback
 
-class DuelView(View):
-    def __init__(self, game: DuelGame, challenger: discord.User, challenged: discord.User):
+class GameSelectView(View):
+    def __init__(self, challenger: discord.User, challenged: discord.User):
         super().__init__(timeout=60)
-        self.game = game
         self.challenger = challenger
         self.challenged = challenged
+        self.selected_game = None
     
-    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.green, row=0)
-    async def accept_button(self, interaction: discord.Interaction, button: Button):
+    @discord.ui.button(label="❌ Tic Tac Toe", style=discord.ButtonStyle.primary, emoji="❌", row=0)
+    async def tictactoe_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.challenged:
-            await interaction.response.send_message("❌ This duel isn't for you!", ephemeral=True)
+            await interaction.response.send_message("This challenge isn't for you!", ephemeral=True)
             return
-        
-        if self.game.cancelled:
-            await interaction.response.send_message("This duel has been cancelled!", ephemeral=True)
-            return
-        
-        self.game.started = True
-        
-        # Mark both users as being in a match
-        users_in_match[self.game.player1.id] = f"{self.game.player1.id}_{self.game.player2.id}"
-        users_in_match[self.game.player2.id] = f"{self.game.player1.id}_{self.game.player2.id}"
-        
-        # Draw initial board
-        board_img = self.game.draw_board()
-        file = discord.File(board_img, filename="board.png")
-        
-        # Create game view for first player
-        first_player = self.game.player1
-        game_view = TicTacToeView(self.game, first_player)
-        
-        turn_msg = f"⚔️ **Match has begun between {self.game.player1.display_name} and {self.game.player2.display_name}** ⚔️\n**{self.game.player1.display_name} is X and {self.game.player2.display_name} is O**\n\n🎮 **{self.game.current_turn}**'s turn ({first_player.display_name})\nClick the buttons below to play!"
-        
-        # Edit the challenge message to start the game
-        await interaction.response.edit_message(content=turn_msg, view=game_view, attachments=[file])
-        
-        # Remove challenge from active_duels
-        duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
-        reverse_key = f"{self.game.player2.id}_{self.game.player1.id}"
-        active_duels.pop(duel_key, None)
-        active_duels.pop(reverse_key, None)
+        self.selected_game = "tictactoe"
+        await self.start_game(interaction)
     
-    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.red, row=0)
+    @discord.ui.button(label="♜ Chess", style=discord.ButtonStyle.success, emoji="♜", row=0)
+    async def chess_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user != self.challenged:
+            await interaction.response.send_message("This challenge isn't for you!", ephemeral=True)
+            return
+        self.selected_game = "chess"
+        await self.start_game(interaction)
+    
+    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.danger, row=1)
     async def decline_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.challenged:
-            await interaction.response.send_message("❌ This duel isn't for you!", ephemeral=True)
+            await interaction.response.send_message("This challenge isn't for you!", ephemeral=True)
             return
-        
-        if self.game.cancelled:
-            await interaction.response.send_message("This duel has been cancelled!", ephemeral=True)
-            return
-        
-        # Edit the message to show refusal and remove buttons
         await interaction.response.edit_message(content=f"😔 {self.challenged.display_name} refused to duel!", view=None)
+        self.stop()
+    
+    async def start_game(self, interaction: discord.Interaction):
+        # Mark both users as being in a match
+        users_in_match[self.challenger.id] = f"{self.challenger.id}_{self.challenged.id}"
+        users_in_match[self.challenged.id] = f"{self.challenger.id}_{self.challenged.id}"
         
-        # Clean up
-        duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
-        reverse_key = f"{self.game.player2.id}_{self.game.player1.id}"
-        active_duels.pop(duel_key, None)
-        active_duels.pop(reverse_key, None)
+        if self.selected_game == "tictactoe":
+            game = TicTacToeGame(self.challenger, self.challenged)
+            active_duels[f"{self.challenger.id}_{self.challenged.id}"] = game
+            
+            # Draw initial board
+            board_img = game.draw_board()
+            file = discord.File(board_img, filename="board.png")
+            
+            # Create game view
+            game_view = TicTacToeView(game, self.challenger)
+            
+            turn_msg = f"⚔️ **Tic Tac Toe Match: {self.challenger.display_name} vs {self.challenged.display_name}** ⚔️\n**{self.challenger.display_name} is X and {self.challenged.display_name} is O**\n\n🎮 **X's turn ({self.challenger.display_name})**\nClick the buttons below to play!"
+            
+            await interaction.response.edit_message(content=turn_msg, view=game_view, attachments=[file])
+            
+        else:  # chess
+            game = ChessGame(self.challenger, self.challenged)
+            active_duels[f"{self.challenger.id}_{self.challenged.id}"] = game
+            game.channel = interaction.channel
+            
+            # Get initial board image
+            board_file = game.get_board_image()
+            
+            # Create chess view
+            chess_view = ChessView(game)
+            
+            start_msg = f"♜ **CHESS MATCH: {self.challenger.display_name} (White) vs {self.challenged.display_name} (Black)** ♞\n\n**White's turn ({self.challenger.display_name})**\n\n📝 **How to play:**\n• Click the 'Make Move' button\n• Type moves like: `e4`, `Nf3`, `O-O`\n• Use `/legal` to see legal moves\n• Use `/resign` to give up"
+            
+            await interaction.response.edit_message(content=start_msg, view=chess_view, attachments=[board_file])
 
 class CancelView(View):
-    def __init__(self, game: DuelGame, canceller: discord.User, opponent: discord.User):
+    def __init__(self, game, canceller: discord.User, opponent: discord.User):
         super().__init__(timeout=30)
         self.game = game
         self.canceller = canceller
@@ -312,7 +455,7 @@ class DuelBot(discord.Client):
 
 bot = DuelBot()
 
-@bot.tree.command(name="duel", description="Challenge another user to a Tic-Tac-Toe duel!")
+@bot.tree.command(name="duel", description="Challenge another user to a game!")
 async def duel(interaction: discord.Interaction, opponent: discord.User):
     if opponent == interaction.user:
         await interaction.response.send_message("You can't duel yourself!", ephemeral=True)
@@ -333,35 +476,117 @@ async def duel(interaction: discord.Interaction, opponent: discord.User):
         await interaction.response.send_message("A duel challenge already exists! Wait for them to respond.", ephemeral=True)
         return
     
-    game = DuelGame(interaction.user, opponent)
-    active_duels[duel_key] = game
-    
-    view = DuelView(game, interaction.user, opponent)
+    view = GameSelectView(interaction.user, opponent)
     
     await interaction.response.send_message(
-        f"🎯 **{interaction.user.display_name}** challenged **{opponent.display_name}** to Tic-Tac-Toe!\n"
-        f"{opponent.mention}, do you accept?",
+        f"🎯 **{interaction.user.display_name}** challenged **{opponent.display_name}** to a duel!\n"
+        f"{opponent.mention}, choose your game:",
         view=view
     )
+
+@bot.tree.command(name="move", description="Make a chess move (chess only)")
+async def chess_move(interaction: discord.Interaction, move: str):
+    """Make a move in chess: /move e4"""
+    if interaction.user.id not in users_in_match:
+        await interaction.response.send_message("❌ You're not in a match!", ephemeral=True)
+        return
+    
+    duel_key = users_in_match[interaction.user.id]
+    game = active_duels.get(duel_key)
+    
+    if not game or not isinstance(game, ChessGame):
+        await interaction.response.send_message("❌ No active chess game found! Use the button in the game message to move.", ephemeral=True)
+        return
+    
+    if game.game_over:
+        await interaction.response.send_message("Game is already over!", ephemeral=True)
+        return
+    
+    success, result = game.make_move(move, interaction.user.id)
+    
+    if success:
+        board_file = game.get_board_image()
+        
+        if game.game_over:
+            await interaction.response.send_message(f"🏆 **{result}** 🏆", file=board_file)
+            # Clean up
+            active_duels.pop(duel_key, None)
+            users_in_match.pop(game.player1.id, None)
+            users_in_match.pop(game.player2.id, None)
+        else:
+            current_player = game.player1 if game.current_turn == "White" else game.player2
+            await interaction.response.send_message(
+                f"{result}\n{current_player.mention}'s turn!",
+                file=board_file
+            )
+    else:
+        await interaction.response.send_message(f"❌ {result}", ephemeral=True)
+
+@bot.tree.command(name="legal", description="Show legal moves (chess only)")
+async def legal_moves(interaction: discord.Interaction):
+    """Show all legal moves in current chess position"""
+    if interaction.user.id not in users_in_match:
+        await interaction.response.send_message("❌ You're not in a match!", ephemeral=True)
+        return
+    
+    duel_key = users_in_match[interaction.user.id]
+    game = active_duels.get(duel_key)
+    
+    if not game or not isinstance(game, ChessGame):
+        await interaction.response.send_message("❌ No active chess game found!", ephemeral=True)
+        return
+    
+    moves_text = game.get_legal_moves_text()
+    await interaction.response.send_message(f"**Legal moves:** {moves_text}", ephemeral=True)
+
+@bot.tree.command(name="resign", description="Resign from current match")
+async def resign(interaction: discord.Interaction):
+    """Resign from your current game"""
+    if interaction.user.id not in users_in_match:
+        await interaction.response.send_message("❌ You're not in a match!", ephemeral=True)
+        return
+    
+    duel_key = users_in_match[interaction.user.id]
+    game = active_duels.get(duel_key)
+    
+    if not game:
+        await interaction.response.send_message("❌ No active game found!", ephemeral=True)
+        return
+    
+    if game.game_over:
+        await interaction.response.send_message("Game is already over!", ephemeral=True)
+        return
+    
+    winner = game.player2 if game.player1 == interaction.user else game.player1
+    game.game_over = True
+    
+    await interaction.response.send_message(f"🏆 {interaction.user.display_name} resigned! {winner.display_name} wins! 🏆")
+    
+    # Clean up
+    active_duels.pop(duel_key, None)
+    users_in_match.pop(game.player1.id, None)
+    users_in_match.pop(game.player2.id, None)
 
 @bot.tree.command(name="cancel", description="Cancel your current duel")
 async def cancel(interaction: discord.Interaction):
     # Check for active match
     if interaction.user.id in users_in_match:
-        for key, game in active_duels.items():
-            if (game.player1 == interaction.user or game.player2 == interaction.user) and game.started:
-                opponent = game.player2 if game.player1 == interaction.user else game.player1
-                view = CancelView(game, interaction.user, opponent)
-                await interaction.response.send_message(
-                    f"⚠️ **{interaction.user.display_name}** wants to cancel!\n"
-                    f"{opponent.mention}, agree?",
-                    view=view
-                )
-                return
+        duel_key = users_in_match[interaction.user.id]
+        game = active_duels.get(duel_key)
+        
+        if game and game.started:
+            opponent = game.player2 if game.player1 == interaction.user else game.player1
+            view = CancelView(game, interaction.user, opponent)
+            await interaction.response.send_message(
+                f"⚠️ **{interaction.user.display_name}** wants to cancel!\n"
+                f"{opponent.mention}, agree?",
+                view=view
+            )
+            return
     
     # Check for pending challenge
     for key, game in active_duels.items():
-        if (game.player1 == interaction.user or game.player2 == interaction.user) and not game.started:
+        if (game.player1 == interaction.user or game.player2 == interaction.user) and not hasattr(game, 'started') or not game.started:
             opponent = game.player2 if game.player1 == interaction.user else game.player1
             game.cancelled = True
             await interaction.response.send_message(f"❌ **{interaction.user.display_name}** cancelled the challenge!")
@@ -374,7 +599,7 @@ async def cancel(interaction: discord.Interaction):
 
 @app.route('/')
 def home():
-    return jsonify({"status": "alive", "bot": "Tic-Tac-Toe Duel Bot"})
+    return jsonify({"status": "alive", "bot": "Multi-Game Duel Bot (Tic Tac Toe + Chess)"})
 
 @app.route('/ping')
 def ping():
