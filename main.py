@@ -308,19 +308,27 @@ async def duel(interaction: discord.Interaction, opponent: discord.User):
     game = DuelGame(interaction.user, opponent)
     active_duels[duel_key] = game
     
-    # Create challenge message - send ONLY to the challenged player (ephemeral)
+    # Create challenge message for the opponent
     view = DuelView(game, interaction.user, opponent)
     
     # Send public announcement that a challenge was issued
     await interaction.response.send_message(f"🎯 **{interaction.user.display_name}** has challenged **{opponent.display_name}** to a Tic-Tac-Toe duel!")
     
-    # Send ephemeral message to the challenged player with accept/decline buttons (only they can see)
-    await interaction.followup.send(
-        f"🎯 **{interaction.user.display_name}** has challenged you to a Tic-Tac-Toe duel!\n"
-        f"Do you accept?",
-        view=view,
-        ephemeral=True
-    )
+    # Send the challenge to the opponent (the person being challenged)
+    # We need to send this as a followup in the same channel but only visible to opponent
+    # Create a new interaction response for the opponent
+    try:
+        # Send ephemeral message directly to the opponent
+        await interaction.followup.send(
+            f"🎯 **{interaction.user.display_name}** has challenged you to a Tic-Tac-Toe duel!\n"
+            f"Do you accept?",
+            view=view,
+            ephemeral=True  # This makes it only visible to the opponent
+        )
+    except Exception as e:
+        print(f"Error sending challenge: {e}")
+        await interaction.followup.send(f"Could not send challenge to {opponent.display_name}.", ephemeral=True)
+        active_duels.pop(duel_key, None)
 
 @bot.tree.command(name="cancel", description="Cancel your current duel")
 async def cancel(interaction: discord.Interaction):
