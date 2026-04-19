@@ -176,12 +176,13 @@ class DuelView(View):
     
     @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.green)
     async def accept_button(self, interaction: discord.Interaction, button: Button):
+        # Check if the person clicking is the challenged player
+        if interaction.user != self.challenged:
+            await interaction.response.send_message("❌ This duel isn't for you!", ephemeral=True)
+            return
+        
         if self.game.cancelled:
             await interaction.response.send_message("This duel has been cancelled!", ephemeral=True)
-            return
-            
-        if interaction.user != self.challenged:
-            await interaction.response.send_message("This duel isn't for you!", ephemeral=True)
             return
         
         self.game.started = True
@@ -206,24 +207,29 @@ class DuelView(View):
         
         await interaction.followup.send(content=turn_msg, view=game_view, file=file)
         
-        # Delete the original ephemeral challenge message
-        await interaction.message.delete()
+        # Disable the buttons on the original challenge message
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
     
     @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.red)
     async def decline_button(self, interaction: discord.Interaction, button: Button):
+        # Check if the person clicking is the challenged player
+        if interaction.user != self.challenged:
+            await interaction.response.send_message("❌ This duel isn't for you!", ephemeral=True)
+            return
+        
         if self.game.cancelled:
             await interaction.response.send_message("This duel has been cancelled!", ephemeral=True)
-            return
-            
-        if interaction.user != self.challenged:
-            await interaction.response.send_message("This duel isn't for you!", ephemeral=True)
             return
         
         # Send public message that player refused
         await interaction.response.send_message(f"😔 {self.challenged.display_name} refused to duel!")
         
-        # Delete the original ephemeral challenge message
-        await interaction.message.delete()
+        # Disable the buttons on the original challenge message
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
         
         # Clean up
         duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
@@ -241,7 +247,7 @@ class CancelView(View):
     @discord.ui.button(label="✅ Confirm Cancel", style=discord.ButtonStyle.red)
     async def confirm_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.opponent:
-            await interaction.response.send_message("You can't cancel someone else's duel!", ephemeral=True)
+            await interaction.response.send_message("❌ This cancel request isn't for you!", ephemeral=True)
             return
         
         self.game.cancelled = True
@@ -257,16 +263,22 @@ class CancelView(View):
         users_in_match.pop(self.game.player2.id, None)
         
         # Disable the view
-        await interaction.message.edit(view=None)
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
     
     @discord.ui.button(label="❌ Keep Match", style=discord.ButtonStyle.green)
     async def keep_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.opponent:
-            await interaction.response.send_message("This isn't for you!", ephemeral=True)
+            await interaction.response.send_message("❌ This cancel request isn't for you!", ephemeral=True)
             return
         
         await interaction.response.send_message(f"✅ {self.opponent.display_name} wants to continue the match!")
-        await interaction.message.edit(view=None)
+        
+        # Disable the view
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
 
 class DuelBot(discord.Client):
     def __init__(self):
@@ -308,27 +320,15 @@ async def duel(interaction: discord.Interaction, opponent: discord.User):
     game = DuelGame(interaction.user, opponent)
     active_duels[duel_key] = game
     
-    # Create challenge message for the opponent
+    # Create challenge message with buttons visible to everyone
     view = DuelView(game, interaction.user, opponent)
     
-    # Send public announcement that a challenge was issued
-    await interaction.response.send_message(f"🎯 **{interaction.user.display_name}** has challenged **{opponent.display_name}** to a Tic-Tac-Toe duel!")
-    
-    # Send the challenge to the opponent (the person being challenged)
-    # We need to send this as a followup in the same channel but only visible to opponent
-    # Create a new interaction response for the opponent
-    try:
-        # Send ephemeral message directly to the opponent
-        await interaction.followup.send(
-            f"🎯 **{interaction.user.display_name}** has challenged you to a Tic-Tac-Toe duel!\n"
-            f"Do you accept?",
-            view=view,
-            ephemeral=True  # This makes it only visible to the opponent
-        )
-    except Exception as e:
-        print(f"Error sending challenge: {e}")
-        await interaction.followup.send(f"Could not send challenge to {opponent.display_name}.", ephemeral=True)
-        active_duels.pop(duel_key, None)
+    # Send public message that everyone can see with the buttons
+    await interaction.response.send_message(
+        f"🎯 **{interaction.user.display_name}** has challenged **{opponent.display_name}** to a Tic-Tac-Toe duel!\n"
+        f"{opponent.mention}, do you accept?",
+        view=view
+    )
 
 @bot.tree.command(name="cancel", description="Cancel your current duel")
 async def cancel(interaction: discord.Interaction):
@@ -376,12 +376,11 @@ async def cancel(interaction: discord.Interaction):
     
     view = CancelView(user_duel, interaction.user, opponent)
     
-    # Send ephemeral message to opponent only
+    # Send public message that everyone can see with cancel buttons
     await interaction.response.send_message(
         f"⚠️ **{interaction.user.display_name}** wants to cancel the match!\n"
-        f"Do you agree to cancel?",
-        view=view,
-        ephemeral=True
+        f"{opponent.mention}, do you agree to cancel?",
+        view=view
     )
 
 # Flask route for health check
