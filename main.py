@@ -88,18 +88,15 @@ class DuelGame:
             else:
                 # Draw number in empty cell
                 try:
-                    # Try to load a font
                     font = ImageFont.truetype("arial.ttf", 60)
                 except:
                     font = ImageFont.load_default()
                 
                 number = str(i + 1)
-                # Get text size
                 bbox = draw.textbbox((0, 0), number, font=font)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
                 
-                # Center the number
                 text_x = x + (CELL_SIZE - text_width) // 2
                 text_y = y + (CELL_SIZE - text_height) // 2
                 
@@ -113,7 +110,6 @@ class DuelGame:
             end_y = (self.winning_cells[2] // 3) * CELL_SIZE + CELL_SIZE // 2
             draw.line((start_x, start_y, end_x, end_y), fill="green", width=10)
         
-        # Convert to bytes
         img_buffer = io.BytesIO()
         img.save(img_buffer, format='PNG')
         img_buffer.seek(0)
@@ -121,33 +117,30 @@ class DuelGame:
 
 class TicTacToeView(View):
     def __init__(self, game: DuelGame, current_player: discord.User):
-        super().__init__(timeout=300)  # 5 minutes timeout
+        super().__init__(timeout=300)
         self.game = game
         self.current_player = current_player
         self.add_buttons()
     
     def add_buttons(self):
-        # Create a 3x3 grid of buttons that matches the board layout
         # Row 0 (top row)
-        self.add_item(self.create_button(0, 0, 0))  # Position 1 (top-left)
-        self.add_item(self.create_button(1, 0, 1))  # Position 2 (top-middle)
-        self.add_item(self.create_button(2, 0, 2))  # Position 3 (top-right)
+        self.add_item(self.create_button(0, 0))
+        self.add_item(self.create_button(1, 0))
+        self.add_item(self.create_button(2, 0))
         
         # Row 1 (middle row)
-        self.add_item(self.create_button(3, 1, 0))  # Position 4 (middle-left)
-        self.add_item(self.create_button(4, 1, 1))  # Position 5 (center)
-        self.add_item(self.create_button(5, 1, 2))  # Position 6 (middle-right)
+        self.add_item(self.create_button(3, 1))
+        self.add_item(self.create_button(4, 1))
+        self.add_item(self.create_button(5, 1))
         
         # Row 2 (bottom row)
-        self.add_item(self.create_button(6, 2, 0))  # Position 7 (bottom-left)
-        self.add_item(self.create_button(7, 2, 1))  # Position 8 (bottom-middle)
-        self.add_item(self.create_button(8, 2, 2))  # Position 9 (bottom-right)
+        self.add_item(self.create_button(6, 2))
+        self.add_item(self.create_button(7, 2))
+        self.add_item(self.create_button(8, 2))
     
-    def create_button(self, position: int, row: int, col: int) -> Button:
-        # Check if cell is empty
+    def create_button(self, position: int, row: int) -> Button:
         is_empty = self.game.board[position] == ""
         
-        # Button label (number if empty, otherwise X or O)
         if is_empty:
             label = str(position + 1)
             style = discord.ButtonStyle.primary
@@ -167,7 +160,6 @@ class TicTacToeView(View):
                 await interaction.response.send_message("This match has been cancelled!", ephemeral=True)
                 return
                 
-            # Check if it's the right player's turn
             expected_player = self.game.player1 if self.game.current_turn == "X" else self.game.player2
             if interaction.user != expected_player:
                 await interaction.response.send_message("It's not your turn!", ephemeral=True)
@@ -180,7 +172,7 @@ class TicTacToeView(View):
             # Make the move
             self.game.make_move(position)
             
-            # Update board image
+            # Draw new board
             board_img = self.game.draw_board()
             file = discord.File(board_img, filename="board.png")
             
@@ -195,20 +187,21 @@ class TicTacToeView(View):
                 else:
                     result_msg = "It's a tie! 🤝"
                 
-                await interaction.response.edit_message(content=result_msg, view=None)
-                await interaction.followup.send(file=file)
+                # Edit the message to show result and remove buttons
+                await interaction.response.edit_message(content=result_msg, view=None, attachments=[file])
+                
                 # Clean up
                 duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
                 reverse_key = f"{self.game.player2.id}_{self.game.player1.id}"
                 active_duels.pop(duel_key, None)
                 active_duels.pop(reverse_key, None)
-                # Remove users from match tracking
                 users_in_match.pop(self.game.player1.id, None)
                 users_in_match.pop(self.game.player2.id, None)
             else:
-                turn_msg = f"🎮 **{self.game.current_turn}**'s turn ({expected_player.display_name})"
-                await interaction.response.edit_message(content=turn_msg, view=new_view)
-                await interaction.followup.send(file=file)
+                turn_msg = f"🎮 **{self.game.current_turn}**'s turn ({expected_player.display_name})\nClick the buttons below to play!"
+                
+                # Edit the existing message with new board and buttons
+                await interaction.response.edit_message(content=turn_msg, view=new_view, attachments=[file])
         
         return callback
 
@@ -235,11 +228,7 @@ class DuelView(View):
         users_in_match[self.game.player1.id] = f"{self.game.player1.id}_{self.game.player2.id}"
         users_in_match[self.game.player2.id] = f"{self.game.player1.id}_{self.game.player2.id}"
         
-        # Start the game - send public message
-        await interaction.response.send_message(f"⚔️ **Match has begun between {self.game.player1.display_name} and {self.game.player2.display_name}** ⚔️\n"
-                                               f"**{self.game.player1.display_name} is X and {self.game.player2.display_name} is O**")
-        
-        # Send initial board
+        # Draw initial board
         board_img = self.game.draw_board()
         file = discord.File(board_img, filename="board.png")
         
@@ -247,14 +236,10 @@ class DuelView(View):
         first_player = self.game.player1
         game_view = TicTacToeView(self.game, first_player)
         
-        turn_msg = f"🎮 **{self.game.current_turn}**'s turn ({first_player.display_name})\nClick the buttons below to play!"
+        turn_msg = f"⚔️ **Match has begun between {self.game.player1.display_name} and {self.game.player2.display_name}** ⚔️\n**{self.game.player1.display_name} is X and {self.game.player2.display_name} is O**\n\n🎮 **{self.game.current_turn}**'s turn ({first_player.display_name})\nClick the buttons below to play!"
         
-        await interaction.followup.send(content=turn_msg, view=game_view, file=file)
-        
-        # Disable the buttons on the original challenge message
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
+        # Edit the challenge message to start the game
+        await interaction.response.edit_message(content=turn_msg, view=game_view, attachments=[file])
         
         # Remove challenge from active_duels
         duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
@@ -272,12 +257,8 @@ class DuelView(View):
             await interaction.response.send_message("This duel has been cancelled!", ephemeral=True)
             return
         
-        await interaction.response.send_message(f"😔 {self.challenged.display_name} refused to duel!")
-        
-        # Disable the buttons
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
+        # Edit the message to show refusal and remove buttons
+        await interaction.response.edit_message(content=f"😔 {self.challenged.display_name} refused to duel!", view=None)
         
         # Clean up
         duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
@@ -299,7 +280,9 @@ class CancelView(View):
             return
         
         self.game.cancelled = True
-        await interaction.response.send_message(f"❌ **{self.canceller.display_name}** cancelled the match!")
+        
+        # Edit the message to show cancellation
+        await interaction.response.edit_message(content=f"❌ **{self.canceller.display_name}** cancelled the match!", view=None)
         
         # Clean up
         duel_key = f"{self.game.player1.id}_{self.game.player2.id}"
@@ -308,10 +291,6 @@ class CancelView(View):
         active_duels.pop(reverse_key, None)
         users_in_match.pop(self.game.player1.id, None)
         users_in_match.pop(self.game.player2.id, None)
-        
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
     
     @discord.ui.button(label="❌ Keep Match", style=discord.ButtonStyle.green, row=0)
     async def keep_button(self, interaction: discord.Interaction, button: Button):
@@ -319,11 +298,8 @@ class CancelView(View):
             await interaction.response.send_message("❌ This cancel request isn't for you!", ephemeral=True)
             return
         
-        await interaction.response.send_message(f"✅ {self.opponent.display_name} wants to continue the match!")
-        
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
+        # Edit the message to show match continues
+        await interaction.response.edit_message(content=f"✅ {self.opponent.display_name} wants to continue the match!", view=None)
 
 class DuelBot(discord.Client):
     def __init__(self):
@@ -370,6 +346,7 @@ async def duel(interaction: discord.Interaction, opponent: discord.User):
 
 @bot.tree.command(name="cancel", description="Cancel your current duel")
 async def cancel(interaction: discord.Interaction):
+    # Check for active match
     if interaction.user.id in users_in_match:
         for key, game in active_duels.items():
             if (game.player1 == interaction.user or game.player2 == interaction.user) and game.started:
@@ -382,6 +359,7 @@ async def cancel(interaction: discord.Interaction):
                 )
                 return
     
+    # Check for pending challenge
     for key, game in active_duels.items():
         if (game.player1 == interaction.user or game.player2 == interaction.user) and not game.started:
             opponent = game.player2 if game.player1 == interaction.user else game.player1
